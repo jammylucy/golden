@@ -1,10 +1,14 @@
 (function () {
-  if (window.__bgHook) return;
+  if (window.__bgHookVersion >= 4) return;
+  window.__bgHookVersion = 4;
   window.__bgHook = true;
   window.__bgLog = [];
   const recent = [];                 // captured {url, method, query, params, responseText} for matching
   const MAX = 100;
   const dec = new TextDecoder();
+  const pendingKeys = [];
+  const keyInfo = new WeakMap();
+  let nextId = 1;
 
   function parseUrl(url) {
     const out = { url: String(url || ''), fullUrl: String(url || ''), query: {} };
@@ -76,9 +80,13 @@
   }
 
   const pushRecent = (info) => {
-    const item = Object.assign({ id: recent.length + 1, capturedAt: Date.now() }, info);
-    if (recent.length >= MAX) recent.shift();
-    recent.push(item);
+    const item = info || {};
+    if (!item.id) item.id = nextId++;
+    item.capturedAt = Date.now();
+    if (recent.indexOf(item) === -1) {
+      if (recent.length >= MAX) recent.shift();
+      recent.push(item);
+    }
     return item;
   };
 
@@ -91,9 +99,34 @@
     return bytes.length + ':' + btoa(s);
   }
 
+  function isResponseAesKey(key) {
+    return key && key.type === 'secret' && key.algorithm && key.algorithm.name === 'AES-GCM';
+  }
+
+  function claimPendingKey(info) {
+    const now = Date.now();
+    while (pendingKeys.length && now - pendingKeys[0].at > 15000) pendingKeys.shift();
+    const item = pendingKeys.shift();
+    if (!item) return;
+    info.cryptoKeyCaptured = true;
+    info.cryptoKeyAt = item.at;
+    keyInfo.set(item.key, info);
+  }
+
+  function candidateSummary(item) {
+    return {
+      id: item.id,
+      method: item.method,
+      url: item.url,
+      params: item.params,
+      status: item.status,
+      via: item.via
+    };
+  }
+
   // match a decrypt call to its source request by exact ciphertext bytes.
   // If multiple requests have the same ciphertext, do not guess a URL.
-  function match(ct) {
+  function matchByCipher(ct) {
     const matches = [];
     const key = cipherKey(ct);
     for (let i = recent.length - 1; i >= 0; i--) {
@@ -103,24 +136,38 @@
       const cand = d.slice(12);        // strip 12-byte IV -> ct+tag (== decrypt's data arg)
       if (cand.length === ct.length && eq(cand, ct)) matches.push(recent[i]);
     }
-    if (matches.length === 1) return Object.assign({ __matched: true, cipherKey: key }, matches[0]);
+    if (matches.length === 1) return Object.assign({ __matched: true, strategy: 'ciphertext', cipherKey: key }, matches[0]);
     if (matches.length > 1) {
       return {
         __matched: false,
         __ambiguous: true,
+        strategy: 'ciphertext',
         cipherKey: key,
-        candidates: matches.map(item => ({
-          id: item.id,
-          method: item.method,
-          url: item.url,
-          params: item.params,
-          status: item.status,
-          via: item.via
-        }))
+        candidates: matches.map(candidateSummary)
       };
     }
     return { __matched: false, cipherKey: key };
   }
+
+  function matchByCryptoKey(key, ct) {
+    if (!isResponseAesKey(key) || !keyInfo.has(key)) return null;
+    return Object.assign({ __matched: true, strategy: 'crypto-key', cipherKey: cipherKey(ct) }, keyInfo.get(key));
+  }
+
+  function match(key, ct) {
+    return matchByCryptoKey(key, ct) || matchByCipher(ct);
+  }
+
+  const _generateKey = SubtleCrypto.prototype.generateKey;
+  SubtleCrypto.prototype.generateKey = function () {
+    const result = _generateKey.apply(this, arguments);
+    return Promise.resolve(result).then(key => {
+      try {
+        if (isResponseAesKey(key)) pendingKeys.push({ key, at: Date.now() });
+      } catch (e) {}
+      return key;
+    });
+  };
 
   // ---- hook fetch ----
   const _fetch = window.fetch;
@@ -136,7 +183,6 @@
       const bodyParams = parseBody(body);
       const params = mergeParams(urlInfo.query, bodyParams);
       const requestHeaders = Object.assign({}, getHeaders(input && input.headers), getHeaders(init && init.headers));
-      const resp = await _fetch.apply(this, arguments);
       const info = {
         via: 'fetch',
         method,
@@ -146,16 +192,19 @@
         query: params.query,
         bodyParams: params.body,
         params: params.all,
-        requestHeaders,
-        status: resp && resp.status
+        requestHeaders
       };
+      claimPendingKey(info);
+      const resp = await _fetch.apply(this, arguments);
+      info.status = resp && resp.status;
       try {
         const originalText = resp.text.bind(resp);
         Object.defineProperty(resp, 'text', {
           configurable: true,
           value: async function () {
             const text = await originalText();
-            pushRecent(Object.assign({}, info, { responseText: text }));
+            info.responseText = text;
+            pushRecent(info);
             return text;
           }
         });
@@ -188,22 +237,29 @@
     const params = mergeParams(this.__query, bodyParams);
     this.__bodyParams = bodyParams;
     this.__params = params.all;
-    this.addEventListener('loadend', () => {
+    this.__info = {
+      via: 'xhr',
+      method: this.__method,
+      url: this.__url,
+      rawUrl: this.__rawUrl,
+      path: this.__path,
+      query: this.__query,
+      bodyParams: this.__bodyParams,
+      params: this.__params,
+      requestHeaders: this.__requestHeaders
+    };
+    claimPendingKey(this.__info);
+    const finalize = () => {
+      if (this.__finalized) return;
+      if (this.readyState !== 4) return;
+      this.__finalized = true;
       let t = null; try { t = this.responseText; } catch (e) {} if (t == null) { try { t = this.response; } catch (e) {} }
-      pushRecent({
-        via: 'xhr',
-        method: this.__method,
-        url: this.__url,
-        rawUrl: this.__rawUrl,
-        path: this.__path,
-        query: this.__query,
-        bodyParams: this.__bodyParams,
-        params: this.__params,
-        requestHeaders: this.__requestHeaders,
-        status: this.status,
-        responseText: t
-      });
-    });
+      this.__info.status = this.status;
+      this.__info.responseText = t;
+      pushRecent(this.__info);
+    };
+    this.addEventListener('readystatechange', finalize);
+    this.addEventListener('loadend', finalize);
     return _send.apply(this, arguments);
   };
 
@@ -215,18 +271,20 @@
       const ab = r instanceof ArrayBuffer ? r : await r.arrayBuffer();
       const plain = dec.decode(ab);
       const ct = new Uint8Array(a[2]);
-      const info = match(ct);
+      const info = match(a[1], ct);
       const entry = { i: window.__bgLog.length + 1, time: new Date().toLocaleTimeString(),
         url: info.url, rawUrl: info.rawUrl, path: info.path, method: info.method,
         query: info.query, bodyParams: info.bodyParams, params: info.params,
         requestHeaders: info.requestHeaders, status: info.status, via: info.via,
         matched: !!info.__matched, ambiguous: !!info.__ambiguous,
+        strategy: info.strategy, cryptoKeyCaptured: !!info.cryptoKeyCaptured,
         cipherKey: info.cipherKey, candidates: info.candidates, plain };
       window.__bgLog.push(entry);
       const label = entry.ambiguous ? 'AMBIGUOUS' : entry.matched ? (entry.method || 'GET') : 'UNMATCHED';
       console.groupCollapsed(`%c#${entry.i} [${label}] ${entry.url || '?'}%c  ${plain.slice(0, 70)}`,
         'color:#4af;font-weight:bold', 'color:#9a9');
       console.log('Matched:', entry.matched);
+      console.log('Strategy:', entry.strategy);
       console.log('Cipher :', entry.cipherKey);
       console.log('URL    :', entry.url);
       console.log('Method :', entry.method, info.via ? '(' + info.via + ')' : '');
@@ -246,5 +304,5 @@
   window.__bgFind = (kw) => window.__bgLog.filter(e => (e.url + JSON.stringify(e.params) + e.plain).includes(kw));
   window.__bgClear = () => { window.__bgLog.length = 0; recent.length = 0; };
   window.__bgRecent = recent;
-  console.log('%c[BitGolden hook v3 ready] plaintext -> url/method/query/body/headers', 'color:#0c0');
+  console.log('%c[BitGolden hook v4 ready] crypto-key/ciphertext -> url/method/query/body/headers', 'color:#0c0');
 })();
