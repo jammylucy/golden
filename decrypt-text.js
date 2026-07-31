@@ -54,7 +54,7 @@
   const _open = XMLHttpRequest.prototype.open, _send = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function (m, u) { this.__url = u; this.__method = (m || 'GET').toUpperCase(); return _open.apply(this, arguments); };
   XMLHttpRequest.prototype.send = function (body) {
-    console.log(1111, input, init)
+    console.log(1111, body)
     this.__params = parseBody(body);
     this.addEventListener('loadend', () => {
       let t = null; try { t = this.responseText; } catch (e) {} if (t == null) { try { t = this.response; } catch (e) {} }
