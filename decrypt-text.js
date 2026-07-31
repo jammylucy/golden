@@ -40,6 +40,7 @@
   const _fetch = window.fetch;
   if (_fetch) {
     window.fetch = async function (input, init) {
+      console.log(22222, input, init)
       const url = typeof input === 'string' ? input : (input && input.url) || '';
       const method = ((init && init.method) || 'GET').toUpperCase();
       const params = parseBody(init && init.body);
@@ -53,6 +54,7 @@
   const _open = XMLHttpRequest.prototype.open, _send = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function (m, u) { this.__url = u; this.__method = (m || 'GET').toUpperCase(); return _open.apply(this, arguments); };
   XMLHttpRequest.prototype.send = function (body) {
+    console.log(1111, input, init)
     this.__params = parseBody(body);
     this.addEventListener('loadend', () => {
       let t = null; try { t = this.responseText; } catch (e) {} if (t == null) { try { t = this.response; } catch (e) {} }
