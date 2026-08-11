@@ -1,6 +1,6 @@
 (function () {
-  if (window.__bgHookVersion >= 4) return;
-  window.__bgHookVersion = 4;
+  if (window.__bgHookVersion >= 5) return;
+  window.__bgHookVersion = 5;
   window.__bgHook = true;
   window.__bgLog = [];
   const recent = [];                 // captured {url, method, query, params, responseText} for matching
@@ -9,6 +9,19 @@
   const pendingKeys = [];
   const keyInfo = new WeakMap();
   let nextId = 1;
+  let nativeFetch = window.fetch ? window.fetch.bind(window) : null;
+  let ui = null;
+  const API_BASE = 'https://api.aegisbitgolden.com';
+  const RESPONSE_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqe46RcYXjwtFkTexvQ7F
+59QY/yDd1LedrI7Haqh2vaRZo4nAV8MpvwmA4/i0gqD9CUkT8P8ha6xT+Q+6wnWu
+LMv3e+4JELdddju7cmSDy+zfUrj5eKnoR68vP1q9ooRxc292uLip9WPj8/Ey5SIi
+ki3kMa/nvtKGMn5rGWRt/zf/fxFKxHYhYymnJ2NTgKG/gIK/rnHRiopez4dxYchw
+t6rg7f58fLH1A4v/pUkmBAduydZmqoGKymhsS0/3G5b+R7PNBNYJZyOUkpqe0NtP
+2fh7XkYS8rnfApK93ZVYGY4gx8LBHcvAt615yP7SmQtIAqJosOgXFi1vZdDQ6UNn
+MwIDAQAB
+-----END PUBLIC KEY-----`;
+  let responsePublicKey = null;
 
   function parseUrl(url) {
     const out = { url: String(url || ''), fullUrl: String(url || ''), query: {} };
@@ -42,6 +55,23 @@
     return body;
   }
 
+  function stringifyBody(body) {
+    if (body === undefined || body === null) return '';
+    if (typeof body === 'string') return body;
+    if (body instanceof FormData || body instanceof URLSearchParams) return JSON.stringify(parseBody(body), null, 2);
+    if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return '';
+    try { return JSON.stringify(body, null, 2); } catch (e) { return String(body); }
+  }
+
+  function safeJson(text, fallback) {
+    try {
+      if (text == null || String(text).trim() === '') return fallback;
+      return JSON.parse(text);
+    } catch (e) {
+      return fallback;
+    }
+  }
+
   function mergeParams(query, body) {
     const hasBody = body && !(typeof body === 'object' && !Array.isArray(body) && Object.keys(body).length === 0);
     return {
@@ -62,6 +92,110 @@
       Object.keys(headers).forEach(k => out[k] = headers[k]);
     } catch (e) {}
     return out;
+  }
+
+  function setHeader(headers, key, value) {
+    const existing = Object.keys(headers).find(k => k.toLowerCase() === key.toLowerCase());
+    headers[existing || key] = value;
+  }
+
+  function removeHeader(headers, key) {
+    const existing = Object.keys(headers).find(k => k.toLowerCase() === key.toLowerCase());
+    if (existing) delete headers[existing];
+  }
+
+  function randomNonce(len) {
+    const chars = '0123456789abcdefghijklmnopqrstuvwxyz';
+    let out = '';
+    for (let i = 0; i < len; i += 1) out += chars.charAt(Math.floor(Math.random() * chars.length));
+    return out;
+  }
+
+  function sortedParamString(params) {
+    if (!params || typeof params !== 'object' || Array.isArray(params)) return '';
+    return Object.keys(params).sort().map(k => k + '=' + params[k]).join('&');
+  }
+
+  async function sha256Hex(text) {
+    if (window.CryptoJS && window.CryptoJS.SHA256) return window.CryptoJS.SHA256(text).toString();
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function isLoginUrl(url) {
+    try {
+      const u = new URL(url, location.href);
+      return u.pathname === '/uc/login' || u.pathname.endsWith('/uc/login');
+    } catch (e) {
+      return url === '/uc/login' || String(url || '').endsWith('/uc/login');
+    }
+  }
+
+  async function addRuntimeHeaders(request) {
+    const headers = Object.assign({}, request.headers || {});
+    const token = localStorage.getItem('token') || '';
+    const salt = localStorage.getItem('salt') || '';
+    const login = isLoginUrl(request.url);
+    if (!login) setHeader(headers, 'access-auth-token', token);
+    else removeHeader(headers, 'access-auth-token');
+    if (!Object.keys(headers).some(k => k.toLowerCase() === 'content-type')) setHeader(headers, 'Content-Type', 'multipart/form-data');
+    setHeader(headers, 'equipment', window.innerWidth < 640 ? 'H5' : 'PC');
+    setHeader(headers, 'lang', localStorage.getItem('lang') || 'zh_cn');
+    if (!login && token) {
+      const nonce = randomNonce(8);
+      const timestamp = Date.now();
+      const params = String(request.method || 'GET').toLowerCase() === 'get' ? request.query : request.bodyParams;
+      const joined = sortedParamString(params);
+      const signText = joined ? joined + '&' + salt : salt;
+      setHeader(headers, 'nonce', nonce);
+      setHeader(headers, 'timestamp', timestamp);
+      setHeader(headers, 'signature', await sha256Hex(signText));
+      request.__signText = signText;
+    } else {
+      removeHeader(headers, 'nonce');
+      removeHeader(headers, 'timestamp');
+      removeHeader(headers, 'signature');
+    }
+    request.headers = headers;
+    return request;
+  }
+
+  function pemToArrayBuffer(pem) {
+    const body = pem.replace(/-----BEGIN PUBLIC KEY-----/g, '').replace(/-----END PUBLIC KEY-----/g, '').replace(/\s/g, '');
+    return b64(body).buffer;
+  }
+
+  function arrayBufferToB64(buf) {
+    const bytes = new Uint8Array(buf);
+    let s = '';
+    for (let i = 0; i < bytes.byteLength; i += 1) s += String.fromCharCode(bytes[i]);
+    return btoa(s);
+  }
+
+  async function prepareEncryptedResponse(headers) {
+    if (!crypto.subtle || !window.isSecureContext) return null;
+    const aesKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+    const raw = await crypto.subtle.exportKey('raw', aesKey);
+    responsePublicKey = responsePublicKey || await crypto.subtle.importKey(
+      'spki',
+      pemToArrayBuffer(RESPONSE_PUBLIC_KEY),
+      { name: 'RSA-OAEP', hash: 'SHA-256' },
+      false,
+      ['encrypt']
+    );
+    const encryptedKey = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, responsePublicKey, raw);
+    setHeader(headers, 'dev-encode-body', 'true');
+    setHeader(headers, 'x-response-key', arrayBufferToB64(encryptedKey));
+    return aesKey;
+  }
+
+  async function decodeMaybeEncryptedResponse(text, aesKey) {
+    if (!aesKey || typeof text !== 'string' || text.indexOf('v2:') !== 0) return text;
+    const bytes = b64(text.slice(3));
+    const iv = bytes.slice(0, 12);
+    const data = bytes.slice(12);
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, data);
+    return dec.decode(plain);
   }
 
   function responseString(value) {
@@ -87,6 +221,7 @@
       if (recent.length >= MAX) recent.shift();
       recent.push(item);
     }
+    renderUi();
     return item;
   };
 
@@ -158,6 +293,229 @@
     return matchByCryptoKey(key, ct) || matchByCipher(ct);
   }
 
+  function cloneForReplay(item) {
+    const headers = Object.assign({}, item && item.requestHeaders || {});
+    ['nonce', 'timestamp', 'signature', 'x-response-key'].forEach(k => removeHeader(headers, k));
+    return {
+      method: (item && item.method) || 'POST',
+      url: (item && (item.rawUrl || item.url)) || API_BASE,
+      headers,
+      query: Object.assign({}, item && item.query || {}),
+      bodyParams: item && typeof item.bodyParams === 'object' && !Array.isArray(item.bodyParams) ? Object.assign({}, item.bodyParams) : {}
+    };
+  }
+
+  function buildUrl(url, query) {
+    const raw = url || API_BASE;
+    const u = new URL(raw, String(raw).charAt(0) === '/' ? API_BASE : location.href);
+    Object.keys(query || {}).forEach(k => {
+      if (query[k] !== undefined && query[k] !== null) u.searchParams.set(k, query[k]);
+    });
+    return u.href;
+  }
+
+  function makeBodyAndHeaders(method, bodyParams, headers) {
+    if (String(method || 'GET').toUpperCase() === 'GET') return { body: undefined, headers };
+    const contentTypeKey = Object.keys(headers).find(k => k.toLowerCase() === 'content-type');
+    const contentType = contentTypeKey ? String(headers[contentTypeKey] || '').toLowerCase() : '';
+    if (contentType.includes('application/json')) {
+      setHeader(headers, 'Content-Type', 'application/json');
+      return { body: JSON.stringify(bodyParams || {}), headers };
+    }
+    if (contentType.includes('application/x-www-form-urlencoded')) {
+      return { body: new URLSearchParams(bodyParams || {}).toString(), headers };
+    }
+    if (contentType.includes('multipart/form-data') || !contentType) {
+      if (contentTypeKey) delete headers[contentTypeKey];
+      const form = new FormData();
+      Object.keys(bodyParams || {}).forEach(k => {
+        if (bodyParams[k] !== undefined && bodyParams[k] !== null) form.append(k, bodyParams[k]);
+      });
+      return { body: form, headers };
+    }
+    return { body: typeof bodyParams === 'string' ? bodyParams : JSON.stringify(bodyParams || {}), headers };
+  }
+
+  async function replayRequest(input) {
+    if (!nativeFetch) throw new Error('当前环境没有 fetch，无法重放请求');
+    const source = typeof input === 'number' ? recent.find(x => x.id === input) : input;
+    const request = cloneForReplay(source || {});
+    if (source && source.headers) request.headers = Object.assign(request.headers, source.headers);
+    if (input && typeof input === 'object' && !Array.isArray(input)) {
+      request.method = input.method || request.method;
+      request.url = input.url || request.url;
+      request.query = input.query || request.query;
+      request.bodyParams = input.bodyParams || input.body || request.bodyParams;
+      request.headers = Object.assign(request.headers, input.headers || {});
+      request.encryptedResponse = !!input.encryptedResponse;
+    }
+    if (!input || input.autoSign !== false) await addRuntimeHeaders(request);
+    else ['nonce', 'timestamp', 'signature'].forEach(k => removeHeader(request.headers, k));
+    const wantsEncrypted = !!request.encryptedResponse;
+    let aesKey = null;
+    if (wantsEncrypted) aesKey = await prepareEncryptedResponse(request.headers);
+    else {
+      setHeader(request.headers, 'dev-encode-body', 'false');
+      removeHeader(request.headers, 'x-response-key');
+    }
+    ['content-length', 'host', 'origin', 'referer'].forEach(k => removeHeader(request.headers, k));
+    const finalUrl = String(request.method || 'GET').toUpperCase() === 'GET' ? buildUrl(request.url, request.query) : buildUrl(request.url, {});
+    const bodyResult = makeBodyAndHeaders(request.method, request.bodyParams, request.headers);
+    const started = Date.now();
+    const resp = await nativeFetch(finalUrl, {
+      method: request.method,
+      headers: bodyResult.headers,
+      body: bodyResult.body,
+      credentials: 'include'
+    });
+    const rawText = await resp.text();
+    const text = await decodeMaybeEncryptedResponse(rawText, aesKey);
+    return {
+      ok: resp.ok,
+      status: resp.status,
+      statusText: resp.statusText,
+      ms: Date.now() - started,
+      url: finalUrl,
+      method: request.method,
+      signText: request.__signText,
+      requestHeaders: bodyResult.headers,
+      requestBody: request.bodyParams,
+      responseHeaders: getHeaders(resp.headers),
+      rawText,
+      text,
+      json: safeJson(text, null)
+    };
+  }
+
+  function createEl(tag, props, children) {
+    const el = document.createElement(tag);
+    Object.keys(props || {}).forEach(k => {
+      if (k === 'style') Object.assign(el.style, props[k]);
+      else if (k === 'text') el.textContent = props[k];
+      else el.setAttribute(k, props[k]);
+    });
+    (children || []).forEach(c => el.appendChild(c));
+    return el;
+  }
+
+  function installUi() {
+    if (ui || !document.body) return;
+    const css = {
+      panel: {
+        position: 'fixed', right: '16px', bottom: '64px', width: '560px', maxWidth: 'calc(100vw - 24px)',
+        height: '680px', maxHeight: 'calc(100vh - 92px)', background: '#111827', color: '#e5e7eb',
+        border: '1px solid #374151', borderRadius: '8px', zIndex: 2147483647, display: 'none',
+        font: '12px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif', boxShadow: '0 18px 45px rgba(0,0,0,.35)', overflow: 'auto'
+      },
+      row: { display: 'flex', gap: '8px', alignItems: 'center', padding: '8px' },
+      input: { background: '#030712', color: '#e5e7eb', border: '1px solid #374151', borderRadius: '6px', padding: '6px', font: '12px monospace' },
+      area: { width: '100%', height: '98px', resize: 'vertical', background: '#030712', color: '#e5e7eb', border: '1px solid #374151', borderRadius: '6px', padding: '8px', font: '12px monospace', boxSizing: 'border-box' },
+      btn: { background: '#2563eb', color: '#fff', border: '0', borderRadius: '6px', padding: '7px 10px', cursor: 'pointer' },
+      ghost: { background: '#374151', color: '#e5e7eb', border: '0', borderRadius: '6px', padding: '7px 10px', cursor: 'pointer' }
+    };
+    const toggle = createEl('button', { text: 'BG API', style: Object.assign({}, css.btn, { position: 'fixed', right: '16px', bottom: '16px', zIndex: 2147483647 }) });
+    const panel = createEl('div', { style: css.panel });
+    const header = createEl('div', { style: Object.assign({}, css.row, { justifyContent: 'space-between', borderBottom: '1px solid #374151' }) });
+    header.appendChild(createEl('strong', { text: 'BitGolden API Debugger' }));
+    const close = createEl('button', { text: '收起', style: css.ghost });
+    header.appendChild(close);
+
+    const select = createEl('select', { style: Object.assign({}, css.input, { flex: '1' }) });
+    const load = createEl('button', { text: '载入', style: css.ghost });
+    const method = createEl('select', { style: css.input });
+    ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].forEach(m => method.appendChild(createEl('option', { text: m, value: m })));
+    const url = createEl('input', { style: Object.assign({}, css.input, { flex: '1' }) });
+    const headers = createEl('textarea', { style: css.area });
+    const query = createEl('textarea', { style: css.area });
+    const body = createEl('textarea', { style: css.area });
+    const autoSign = createEl('input', { type: 'checkbox' });
+    autoSign.checked = true;
+    const encrypted = createEl('input', { type: 'checkbox' });
+    const send = createEl('button', { text: '发送', style: css.btn });
+    const clear = createEl('button', { text: '清空日志', style: css.ghost });
+    const output = createEl('pre', { style: Object.assign({}, css.input, { height: '130px', overflow: 'auto', margin: '8px', whiteSpace: 'pre-wrap' }) });
+
+    function label(text, child) {
+      const wrap = createEl('label', { style: { display: 'block', padding: '6px 8px 0', color: '#cbd5e1' } });
+      wrap.appendChild(document.createTextNode(text));
+      if (child) wrap.appendChild(child);
+      return wrap;
+    }
+
+    panel.appendChild(header);
+    panel.appendChild(createEl('div', { style: css.row }, [select, load]));
+    panel.appendChild(createEl('div', { style: css.row }, [method, url]));
+    panel.appendChild(label('Headers JSON'));
+    panel.appendChild(createEl('div', { style: { padding: '0 8px' } }, [headers]));
+    panel.appendChild(label('Query JSON'));
+    panel.appendChild(createEl('div', { style: { padding: '0 8px' } }, [query]));
+    panel.appendChild(label('Body JSON'));
+    panel.appendChild(createEl('div', { style: { padding: '0 8px' } }, [body]));
+    const opts = createEl('div', { style: css.row });
+    opts.appendChild(autoSign);
+    opts.appendChild(createEl('span', { text: '自动重算 token/nonce/timestamp/signature' }));
+    opts.appendChild(encrypted);
+    opts.appendChild(createEl('span', { text: '请求加密响应' }));
+    opts.appendChild(send);
+    opts.appendChild(clear);
+    panel.appendChild(opts);
+    panel.appendChild(output);
+    document.body.appendChild(toggle);
+    document.body.appendChild(panel);
+
+    function fillFrom(item) {
+      const r = cloneForReplay(item);
+      method.value = r.method;
+      url.value = r.url || API_BASE;
+      headers.value = JSON.stringify(r.headers, null, 2);
+      query.value = JSON.stringify(r.query || {}, null, 2);
+      body.value = JSON.stringify(r.bodyParams || {}, null, 2);
+    }
+
+    load.onclick = () => {
+      const item = recent.find(x => String(x.id) === select.value) || recent[recent.length - 1];
+      if (item) fillFrom(item);
+    };
+    send.onclick = async () => {
+      output.textContent = 'Sending...';
+      try {
+        const request = {
+          method: method.value,
+          url: url.value,
+          headers: safeJson(headers.value, {}),
+          query: safeJson(query.value, {}),
+          bodyParams: safeJson(body.value, {}),
+          autoSign: autoSign.checked,
+          encryptedResponse: encrypted.checked
+        };
+        const result = await replayRequest(request);
+        output.textContent = JSON.stringify(result.json || result.text || result, null, 2);
+        console.log('[BitGolden replay]', result);
+      } catch (e) {
+        output.textContent = e && e.stack || String(e);
+        console.error('[BitGolden replay failed]', e);
+      }
+    };
+    clear.onclick = () => { window.__bgClear(); renderUi(); output.textContent = 'cleared'; };
+    toggle.onclick = close.onclick = () => { panel.style.display = panel.style.display === 'none' ? 'block' : 'none'; };
+    ui = { panel, select, fillFrom };
+    renderUi();
+    if (recent.length) fillFrom(recent[recent.length - 1]);
+  }
+
+  function renderUi() {
+    if (!ui) return;
+    const value = ui.select.value;
+    ui.select.innerHTML = '';
+    recent.slice().reverse().forEach(item => {
+      const opt = document.createElement('option');
+      opt.value = item.id;
+      opt.textContent = '#' + item.id + ' ' + (item.method || 'GET') + ' ' + (item.path || item.url || '?') + (item.status ? ' [' + item.status + ']' : '');
+      ui.select.appendChild(opt);
+    });
+    if (value) ui.select.value = value;
+  }
+
   const _generateKey = SubtleCrypto.prototype.generateKey;
   SubtleCrypto.prototype.generateKey = function () {
     const result = _generateKey.apply(this, arguments);
@@ -171,6 +529,7 @@
 
   // ---- hook fetch ----
   const _fetch = window.fetch;
+  nativeFetch = _fetch ? _fetch.bind(window) : nativeFetch;
   if (_fetch) {
     window.fetch = async function (input, init) {
       const requestUrl = typeof input === 'string' ? input : (input && input.url) || '';
@@ -302,7 +661,11 @@
   };
 
   window.__bgFind = (kw) => window.__bgLog.filter(e => (e.url + JSON.stringify(e.params) + e.plain).includes(kw));
-  window.__bgClear = () => { window.__bgLog.length = 0; recent.length = 0; };
+  window.__bgReplay = replayRequest;
+  window.__bgOpen = () => { installUi(); if (ui && ui.panel) ui.panel.style.display = 'block'; };
+  window.__bgClear = () => { window.__bgLog.length = 0; recent.length = 0; renderUi(); };
   window.__bgRecent = recent;
-  console.log('%c[BitGolden hook v4 ready] crypto-key/ciphertext -> url/method/query/body/headers', 'color:#0c0');
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installUi, { once: true });
+  else installUi();
+  console.log('%c[BitGolden hook v5 ready] API debugger + replay signing + crypto-key/ciphertext match', 'color:#0c0');
 })();
